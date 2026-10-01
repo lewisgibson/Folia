@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lewis Gibson <12851394+lewisgibson@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:21:31 +0100
+Subject: [PATCH] Do not report halted regions in the watchdog
+
+When the server stops, the region scheduler halts its threads while a
+tick that was running on one of them can still be registered with the
+watchdog. The watchdog then reports "Tick region ... has not responded"
+for a region that is shutting down, and ThreadMXBean#getThreadInfo
+returns null for a thread that has already exited, so
+WatchdogThread#dumpThread throws a NullPointerException and the Folia
+Watchdog Thread dies with an uncaught exception.
+
+Skip a tick whose thread is no longer alive, and skip the dump if the
+thread exits between that check and the dump.
+
+diff --git a/io/papermc/paper/threadedregions/FoliaWatchdogThread.java b/io/papermc/paper/threadedregions/FoliaWatchdogThread.java
+index e9ca1a15049b0211d10401cb78e953b93afaf6c7..4b610ab67b8d7fbce7dca26a612ea9cbc5eebd4b 100644
+--- a/io/papermc/paper/threadedregions/FoliaWatchdogThread.java
++++ b/io/papermc/paper/threadedregions/FoliaWatchdogThread.java
+@@ -68,6 +68,9 @@ public final class FoliaWatchdogThread extends Thread {
+                 if (elapsed <= TimeUnit.SECONDS.toNanos(5L)) {
+                     continue;
+                 }
++                if (!tick.thread.isAlive()) { // Folia - watchdog - the scheduler halted this thread while the tick was still registered
++                    continue;
++                }
+                 tick.lastPrint = now;
+ 
+                 final double totalElapsedS = (double)(now - tick.start) / 1.0E9;
+@@ -82,10 +85,11 @@ public final class FoliaWatchdogThread extends Thread {
+                     LOGGER.error("Global region has not responded in " + totalElapsedS + "s:");
+                 }
+ 
+-                WatchdogThread.dumpThread(
+-                    ManagementFactory.getThreadMXBean().getThreadInfo(tick.thread.threadId(), Integer.MAX_VALUE),
+-                    Bukkit.getServer().getLogger()
+-                );
++                final java.lang.management.ThreadInfo threadInfo = ManagementFactory.getThreadMXBean().getThreadInfo(tick.thread.threadId(), Integer.MAX_VALUE); // Folia - watchdog
++                if (threadInfo == null) { // Folia - watchdog - the thread exited after the check above
++                    continue;
++                }
++                WatchdogThread.dumpThread(threadInfo, Bukkit.getServer().getLogger());
+             }
+         }
+     }
