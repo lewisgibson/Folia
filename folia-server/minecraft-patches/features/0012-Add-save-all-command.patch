@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lewis Gibson <12851394+lewisgibson@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 22:28:52 +0100
+Subject: [PATCH] Add save-all command
+
+Folia does not register save-all, so backup scripts that run save-off,
+save-all flush and save-on fail. Each region section and player is saved by
+the thread that owns it, and the command replies once the files are on disk.
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index 8b06d0c893e07c969d35c4d7528927552c27b48b..a28a1a8f499588dba9fff3a7eaffa18033564dfc 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -463,6 +463,24 @@ public final class ChunkHolderManager {
+         }
+     }
+ 
++    // Folia start - region threading
++    public void saveSection(final int sectionX, final int sectionZ) {
++        final int regionShift = this.world.moonrise$getRegionChunkShift();
++        final int width = 1 << regionShift;
++        final int offsetX = sectionX << regionShift;
++        final int offsetZ = sectionZ << regionShift;
++
++        for (int dz = 0; dz < width; ++dz) {
++            for (int dx = 0; dx < width; ++dx) {
++                final NewChunkHolder holder = this.getChunkHolder(offsetX | dx, offsetZ | dz);
++                if (holder != null) {
++                    holder.save(false);
++                }
++            }
++        }
++    }
++    // Folia end - region threading
++
+     private final ThreadedTicketLevelPropagator ticketLevelPropagator = new ThreadedTicketLevelPropagator() {
+         @Override
+         protected void processLevelUpdates(final Long2ByteLinkedOpenHashMap updates) {
+diff --git a/net/minecraft/commands/Commands.java b/net/minecraft/commands/Commands.java
+index 4ddb5e7ce3529466c3930caa9aa6b18158e9a63d..e5f8c8d0c4010f2dbdc4d352f9e2ea58e73a3d37 100644
+--- a/net/minecraft/commands/Commands.java
++++ b/net/minecraft/commands/Commands.java
+@@ -293,7 +293,7 @@ public class Commands {
+             PardonCommand.register(this.dispatcher);
+             PardonIpCommand.register(this.dispatcher);
+             //PerfCommand.register(this.dispatcher); // Folia - region threading - TODO later
+-            //SaveAllCommand.register(this.dispatcher); // Folia - region threading - TODO later
++            SaveAllCommand.register(this.dispatcher);
+             SaveOffCommand.register(this.dispatcher);
+             SaveOnCommand.register(this.dispatcher);
+             SetPlayerIdleTimeoutCommand.register(this.dispatcher);
+diff --git a/net/minecraft/server/commands/SaveAllCommand.java b/net/minecraft/server/commands/SaveAllCommand.java
+index 299991905c24a7018f8ac60d0c16e56fa43cd710..789c8e9d56a460ff0912d360449b341ec9dce657 100644
+--- a/net/minecraft/server/commands/SaveAllCommand.java
++++ b/net/minecraft/server/commands/SaveAllCommand.java
+@@ -3,15 +3,12 @@ package net.minecraft.server.commands;
+ import com.mojang.brigadier.Command;
+ import com.mojang.brigadier.CommandDispatcher;
+ import com.mojang.brigadier.exceptions.CommandSyntaxException;
+-import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
+ import net.minecraft.commands.CommandSourceStack;
+ import net.minecraft.commands.Commands;
+ import net.minecraft.network.chat.Component;
+ import net.minecraft.server.MinecraftServer;
+ 
+ public class SaveAllCommand {
+-    private static final SimpleCommandExceptionType ERROR_FAILED = new SimpleCommandExceptionType(Component.translatable("commands.save.failed"));
+-
+     public static void register(final CommandDispatcher<CommandSourceStack> dispatcher) {
+         dispatcher.register(
+             Commands.literal("save-all")
+@@ -24,12 +21,77 @@ public class SaveAllCommand {
+     private static int saveAll(final CommandSourceStack source, final boolean flush) throws CommandSyntaxException {
+         source.sendSuccess(() -> Component.translatable("commands.save.saving"), false);
+         MinecraftServer server = source.getServer();
+-        boolean success = server.saveEverything(true, flush, true);
+-        if (!success) {
+-            throw ERROR_FAILED.create();
++        // Folia start - region threading
++        final java.util.List<java.util.concurrent.CompletableFuture<Void>> saves = new java.util.ArrayList<>();
++        for (final net.minecraft.server.level.ServerLevel level : server.getAllLevels()) {
++            final it.unimi.dsi.fastutil.longs.LongArrayList sections = new it.unimi.dsi.fastutil.longs.LongArrayList();
++            level.regioniser.computeForAllRegions((region) -> {
++                for (final it.unimi.dsi.fastutil.longs.LongIterator iterator = region.getOwnedSectionsUnsynchronised(); iterator.hasNext();) {
++                    sections.add(iterator.nextLong());
++                }
++            });
++            final int shift = level.regioniser.sectionChunkShift;
++            for (final long section : sections) {
++                final int sectionX = ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkX(section);
++                final int sectionZ = ca.spottedleaf.moonrise.common.util.CoordinateUtils.getChunkZ(section);
++                saves.add(java.util.concurrent.CompletableFuture.runAsync(
++                    () -> level.moonrise$getChunkTaskScheduler().chunkHolderManager.saveSection(sectionX, sectionZ),
++                    (final Runnable run) -> io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(level, sectionX << shift, sectionZ << shift, run)
++                ));
++            }
++        }
++        for (final net.minecraft.server.level.ServerPlayer player : server.getPlayerList().getPlayers()) {
++            final java.util.concurrent.CompletableFuture<Void> save = new java.util.concurrent.CompletableFuture<>();
++            saves.add(save);
++            if (!player.getBukkitEntity().taskScheduler.schedule(
++                (final net.minecraft.server.level.ServerPlayer owned) -> {
++                    try {
++                        server.getPlayerList().save(owned);
++                    } finally {
++                        save.complete(null);
++                    }
++                },
++                (final net.minecraft.server.level.ServerPlayer retired) -> save.complete(null),
++                1L
++            )) {
++                save.complete(null);
++            }
+         }
++        saves.add(java.util.concurrent.CompletableFuture.runAsync(() -> {
++            server.saveGlobalData(flush);
++            for (final net.minecraft.server.level.ServerLevel level : server.getAllLevels()) {
++                new org.bukkit.event.world.WorldSaveEvent(level.getWorld()).callEvent();
++                level.saveLevelData(flush);
++            }
++        }, io.papermc.paper.threadedregions.RegionizedServer.getInstance()::addTask));
+ 
+-        source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
++        // the command runs on the global region, so wait for the saves and flush the files from another thread
++        final java.util.concurrent.CompletableFuture<Void> replied = new java.util.concurrent.CompletableFuture<>();
++        if (source.source instanceof net.minecraft.server.rcon.RconConsoleSource rcon) {
++            rcon.addPendingCompletion(replied);
++        }
++        java.util.concurrent.CompletableFuture.allOf(saves.toArray(new java.util.concurrent.CompletableFuture[0])).thenRunAsync(() -> {
++            if (!flush) {
++                return;
++            }
++            try {
++                for (final net.minecraft.server.level.ServerLevel level : server.getAllLevels()) {
++                    ca.spottedleaf.moonrise.patches.chunk_system.io.MoonriseRegionFileIO.flush(level);
++                    ca.spottedleaf.moonrise.patches.chunk_system.io.MoonriseRegionFileIO.flushRegionStorages(level);
++                }
++            } catch (final java.io.IOException ex) {
++                throw new java.io.UncheckedIOException(ex);
++            }
++        }, net.minecraft.util.Util.backgroundExecutor()).whenComplete((final Void result, final Throwable thr) -> {
++            if (thr == null) {
++                source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
++            } else {
++                MinecraftServer.LOGGER.error("Failed to save the game", thr);
++                source.sendFailure(Component.translatable("commands.save.failed"));
++            }
++            replied.complete(null);
++        });
++        // Folia end - region threading
+         return Command.SINGLE_SUCCESS;
+     }
+ }
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index cd5551c0221ad2a7b5c7d452d8d91ffc9711c3ee..508d08d95398c4eed4138921c7cc2f4dab697ab2 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -911,6 +911,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             })
+             .join();
+         // Folia end - region threading
++        rconConsoleSource.awaitPendingCompletions(10L, java.util.concurrent.TimeUnit.MINUTES); // Folia - region threading
+         return rconConsoleSource.getCommandResponse();
+         // CraftBukkit end
+     }
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index 259eb7574841b1b885093b534440f8a40db4e8e2..3e01b32adc0251eb2fe04597411d5019cb6a218f 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -480,7 +480,7 @@ public abstract class PlayerList {
+         }
+     }
+ 
+-    protected void save(final ServerPlayer player) {
++    public void save(final ServerPlayer player) { // Folia - public
+         if (!player.getBukkitEntity().isPersistent()) return; // CraftBukkit
+         player.lastSave = System.nanoTime(); // Folia - region threading - changed to nanoTime tracking
+         this.playerIo.save(player);
+diff --git a/net/minecraft/server/rcon/RconConsoleSource.java b/net/minecraft/server/rcon/RconConsoleSource.java
+index 7422b29719df2c7615fb894c52e426da608f20f7..a13bc3b9a4e655f009c67411da6c0b9cb0090a8a 100644
+--- a/net/minecraft/server/rcon/RconConsoleSource.java
++++ b/net/minecraft/server/rcon/RconConsoleSource.java
+@@ -26,8 +26,35 @@ public class RconConsoleSource implements CommandSource {
+ 
+     public void prepareForCommand() {
+         this.buffer.setLength(0);
++        this.pendingCompletions.clear(); // Folia - region threading
+     }
+ 
++    // Folia start - region threading
++    private final java.util.concurrent.ConcurrentLinkedQueue<java.util.concurrent.CompletableFuture<?>> pendingCompletions = new java.util.concurrent.ConcurrentLinkedQueue<>();
++
++    public void addPendingCompletion(final java.util.concurrent.CompletableFuture<?> completion) {
++        this.pendingCompletions.add(completion);
++    }
++
++    public void awaitPendingCompletions(final long timeout, final java.util.concurrent.TimeUnit unit) {
++        final long deadline = System.nanoTime() + unit.toNanos(timeout);
++        java.util.concurrent.CompletableFuture<?> completion;
++        while ((completion = this.pendingCompletions.poll()) != null) {
++            try {
++                completion.get(Math.max(0L, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS);
++            } catch (final java.util.concurrent.TimeoutException ex) {
++                MinecraftServer.LOGGER.error("Timed out waiting for an rcon command to finish replying");
++                return;
++            } catch (final InterruptedException ex) {
++                Thread.currentThread().interrupt();
++                return;
++            } catch (final java.util.concurrent.ExecutionException ex) {
++                MinecraftServer.LOGGER.error("An rcon command failed to reply", ex);
++            }
++        }
++    }
++    // Folia end - region threading
++
+     public String getCommandResponse() {
+         return this.buffer.toString();
+     }
