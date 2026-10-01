@@ -19895,6 +19895,19 @@ index f05ab5fdab4cb587974e2864e859e49375f8165e..e00caf8dc68ce49f4011f881f3558347
          }
      }
  
+diff --git a/net/minecraft/world/level/storage/CommandStorage.java b/net/minecraft/world/level/storage/CommandStorage.java
+index c99b9001cefdf6992dfcbe90294f697fe3b2eb64..e790cd6ac94a4e505016b9c195b0abdbb270abdd 100644
+--- a/net/minecraft/world/level/storage/CommandStorage.java
++++ b/net/minecraft/world/level/storage/CommandStorage.java
+@@ -15,7 +15,7 @@ import org.jspecify.annotations.Nullable;
+ 
+ public class CommandStorage {
+     private static final String COMMAND_STORAGE = "command_storage";
+-    private final Map<String, CommandStorage.Container> namespaces = new HashMap<>();
++    private final Map<String, CommandStorage.Container> namespaces = new java.util.concurrent.ConcurrentHashMap<>(); // Folia - region threading
+     private final SavedDataStorage savedDataStorage;
+ 
+     public CommandStorage(final SavedDataStorage savedDataStorage) {
 diff --git a/net/minecraft/world/level/storage/SavedDataStorage.java b/net/minecraft/world/level/storage/SavedDataStorage.java
 index f359e53024019f35aaa5cd8477da708bda2fc57a..81c1541d8fa272e84316e87c3418ee727111a65c 100644
 --- a/net/minecraft/world/level/storage/SavedDataStorage.java
