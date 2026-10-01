@@ -1,0 +1,545 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lewis Gibson <12851394+lewisgibson@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:24:32 +0100
+Subject: [PATCH] Add save-all [flush] for region threading
+
+Folia did not register /save-all, so scripts that bracket a file copy with
+"save-off", "save-all flush" and "save-on" got "Unknown command" and copied
+region files that were still being written. Register the command again.
+
+The invariant: when the command reports "Saved the game" after "save-all
+flush", every chunk, entity chunk, poi chunk and player that was loaded and
+modified before the command was issued has been serialised and written to its
+region file, and the region files have been forced to disk. A failure that the
+server only logs while saving, such as a player file that cannot be written or a
+chunk that fails to serialise, does not turn the reply into a failure, as in
+Paper. save-off stops the autosave, chunk unloads and player disconnects still
+write, as in Paper.
+
+How it holds:
+- Serialising a chunk or a player must be done by the thread that owns it, so
+  RegionizedSaveAll queues one task per region section (RegionizedTaskQueue
+  moves the task correctly if the region merges or splits before it runs, and
+  the section list is taken atomically under the regioniser lock) and one task
+  per player on its entity scheduler.
+- The waiting is done on a dedicated non tick thread. Nothing here blocks a tick
+  thread, so it cannot deadlock a single tick thread configuration on its own
+  region tasks. Level data and the global saved data are written by a task on
+  the global region, which owns them.
+- MoonriseRegionFileIO#flush waits for the I/O queue to be empty, which on a
+  running server may never happen because reads and new saves keep arriving.
+  flushPendingWrites waits for the chunks that had a write pending when it was
+  called, then forces the region files. A later write to one of those chunks
+  reuses its task and is waited on too.
+- The command replies from the worker thread. An rcon client is answered when
+  runCommand returns, so RconConsoleSource lets a command register a pending
+  completion and runCommand waits for it before it reads the response. The rcon
+  reply is the same as vanilla: "Saving the game (this may take a moment!)Saved
+  the game".
+- ServerLevel#noSave is volatile, as it is now written by the global region and
+  read by every region tick, and the autosave of level data and global saved
+  data on the global region honours it, as vanilla's autosave does.
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/io/MoonriseRegionFileIO.java b/ca/spottedleaf/moonrise/patches/chunk_system/io/MoonriseRegionFileIO.java
+index 3bb9b58ee97464687e348e23b99159226415c267..4643353ec574e433d1bcbe36d298fc58325938d2 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/io/MoonriseRegionFileIO.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/io/MoonriseRegionFileIO.java
+@@ -186,6 +186,54 @@ public final class MoonriseRegionFileIO {
+         }
+     }
+ 
++    // Folia start - save-all
++    /**
++     * Blocks until every write that was pending in this world's chunk, entity and poi region file I/O when this method
++     * was called has been written, then forces the region files to disk. Unlike {@link #flush(ServerLevel)} this does
++     * not wait for the queue to become empty, because reads and new saves keep arriving on a running server and would
++     * postpone that forever. A write started after this call is only waited on if it reuses the task of a chunk that
++     * was already waited for. Must not be called from a tick thread.
++     *
++     * @param deadlineNanos {@link System#nanoTime()} value after which to give up waiting
++     * @return {@code false} if a pending write failed or the deadline passed, in which case the data is not on disk
++     */
++    public static boolean flushPendingWrites(final ServerLevel world, final long deadlineNanos) {
++        final java.util.List<ChunkIOTask> pending = new java.util.ArrayList<>();
++        for (final RegionFileType type : CACHED_REGIONFILE_TYPES) {
++            final RegionDataController controller = getControllerFor(world, type);
++            for (final java.util.Iterator<ChunkIOTask> iterator = controller.chunkTasks.valueIterator(); iterator.hasNext();) {
++                final ChunkIOTask task = iterator.next();
++                if (task.inProgressWrite != null) {
++                    pending.add(task);
++                }
++            }
++        }
++
++        boolean ok = true;
++        long failures = 1L;
++        for (final ChunkIOTask task : pending) {
++            final long key = CoordinateUtils.getChunkKey(task.chunkX, task.chunkZ);
++            while (task.regionDataController.chunkTasks.get(key) == task) {
++                if (task.failedWrite || System.nanoTime() - deadlineNanos > 0L) {
++                    ok = false;
++                    break;
++                }
++                Thread.yield();
++                failures = ConcurrentUtil.linearLongBackoff(failures, 125_000L, 5_000_000L); // 125us, 5ms
++            }
++            failures = 1L;
++        }
++
++        try {
++            flushRegionStorages(world);
++        } catch (final IOException ex) {
++            LOGGER.error("Exception when flushing regions in world '" + WorldUtil.getWorldName(world) + "'", ex);
++            ok = false;
++        }
++        return ok;
++    }
++    // Folia end - save-all
++
+     public static void partialFlush(final ServerLevel world, final int tasksRemaining) {
+         for (long failures = 1L;;) { // start at 0.13ms
+             long totalTasks = 0L;
+@@ -961,7 +1009,7 @@ public final class MoonriseRegionFileIO {
+ 
+         private RegionDataController.ReadData readData;
+         private RegionDataController.WriteData writeData;
+-        private boolean failedWrite;
++        private volatile boolean failedWrite; // Folia - save-all - read by flushPendingWrites
+ 
+         public ChunkIOTask(final ServerLevel world, final RegionDataController regionDataController,
+                            final int chunkX, final int chunkZ, final Priority priority, final InProgressRead inProgressRead) {
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+index 8b06d0c893e07c969d35c4d7528927552c27b48b..0a599021e43f7552841d173e1e005dee7f337348 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkHolderManager.java
+@@ -463,6 +463,45 @@ public final class ChunkHolderManager {
+         }
+     }
+ 
++    // Folia start - save-all
++    /**
++     * Saves every chunk holder in the region section ({@code sectionX}, {@code sectionZ}), and does nothing else: it
++     * does not flush. Must run on the tick thread that owns the section, so that the data it serialises is not being
++     * modified concurrently. Returns {@code false} if any holder could not be saved by the calling thread, which
++     * means the caller was not the owner and the section was NOT saved.
++     */
++    public boolean saveSection(final int sectionX, final int sectionZ) {
++        final int regionShift = this.world.moonrise$getRegionChunkShift();
++        final int width = 1 << regionShift;
++        final int offsetX = sectionX << regionShift;
++        final int offsetZ = sectionZ << regionShift;
++
++        boolean ok = true;
++        for (int dz = 0; dz < width; ++dz) {
++            for (int dx = 0; dx < width; ++dx) {
++                final int chunkX = offsetX | dx;
++                final int chunkZ = offsetZ | dz;
++                final NewChunkHolder holder = this.getChunkHolder(chunkX, chunkZ);
++                if (holder == null) {
++                    continue;
++                }
++                if (!TickThread.isTickThreadFor(this.world, chunkX, chunkZ)) {
++                    LOGGER.error("Cannot save chunk (" + chunkX + "," + chunkZ + ") in world '" + WorldUtil.getWorldName(this.world) + "' from a thread that does not own it");
++                    ok = false;
++                    continue;
++                }
++                try {
++                    holder.save(false);
++                } catch (final Throwable thr) {
++                    LOGGER.error("Failed to save chunk (" + chunkX + "," + chunkZ + ") in world '" + WorldUtil.getWorldName(this.world) + "'", thr);
++                    ok = false;
++                }
++            }
++        }
++        return ok;
++    }
++    // Folia end - save-all
++
+     private final ThreadedTicketLevelPropagator ticketLevelPropagator = new ThreadedTicketLevelPropagator() {
+         @Override
+         protected void processLevelUpdates(final Long2ByteLinkedOpenHashMap updates) {
+diff --git a/io/papermc/paper/threadedregions/RegionizedSaveAll.java b/io/papermc/paper/threadedregions/RegionizedSaveAll.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a127ce6afca5ed285f8d79af8fb4d9952400cc2c
+--- /dev/null
++++ b/io/papermc/paper/threadedregions/RegionizedSaveAll.java
+@@ -0,0 +1,211 @@
++package io.papermc.paper.threadedregions;
++
++import ca.spottedleaf.moonrise.common.util.CoordinateUtils;
++import ca.spottedleaf.moonrise.common.util.TickThread;
++import ca.spottedleaf.moonrise.common.util.WorldUtil;
++import ca.spottedleaf.moonrise.patches.chunk_system.io.MoonriseRegionFileIO;
++import com.mojang.logging.LogUtils;
++import it.unimi.dsi.fastutil.longs.LongArrayList;
++import it.unimi.dsi.fastutil.longs.LongIterator;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import org.slf4j.Logger;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++/**
++ * Implements {@code save-all [flush]} for region threading.
++ *
++ * <p>
++ * Invariant: when the returned future completes with {@code true} and {@code flush} was requested, every chunk, entity
++ * chunk, poi chunk and player that was loaded and modified before {@link #saveAll} was called has been serialised and
++ * written to its file and the region files have been forced to disk. Nothing in that guarantee depends on the caller
++ * being a tick thread, and nothing here ever blocks a tick thread.
++ * </p>
++ *
++ * <p>
++ * Serialisation of a chunk or a player has to be done by the thread that owns it, so each region section and each
++ * player is saved by a task queued to its owner (the task queue moves the task correctly if the region merges or
++ * splits before it runs). The waiting for those tasks, and the waiting for the region file I/O to drain, is done by a
++ * dedicated thread that is not a tick thread, so that a single tick thread configuration cannot deadlock on its own
++ * region tasks. Level data and the global saved data are written by a task on the global region, which owns them.
++ * </p>
++ */
++public final class RegionizedSaveAll {
++
++    private static final Logger LOGGER = LogUtils.getClassLogger();
++
++    private static final long TIMEOUT_NANOS = TimeUnit.MINUTES.toNanos(10L);
++
++    // one at a time: overlapping save-alls would just contend for the same regions and the same I/O queue
++    private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor((final Runnable run) -> {
++        final Thread thread = new Thread(run, "Save-all thread");
++        thread.setDaemon(true);
++        return thread;
++    });
++
++    private RegionizedSaveAll() {}
++
++    /**
++     * Starts a save. The future completes with {@code true} once everything requested has been saved and, if
++     * {@code flush}, is durably on disk, and with {@code false} if any part failed or the server stopped first. It never
++     * completes exceptionally.
++     */
++    public static CompletableFuture<Boolean> saveAll(final MinecraftServer server, final boolean flush) {
++        final CompletableFuture<Boolean> ret = new CompletableFuture<>();
++        EXECUTOR.execute(() -> {
++            boolean result;
++            try {
++                result = run(server, flush);
++            } catch (final Throwable thr) {
++                LOGGER.error("save-all failed", thr);
++                result = false;
++            }
++            ret.complete(Boolean.valueOf(result));
++        });
++        return ret;
++    }
++
++    private static boolean await(final MinecraftServer server, final CountDownLatch latch, final long deadline, final String what) throws InterruptedException {
++        while (!latch.await(200L, TimeUnit.MILLISECONDS)) {
++            if (!server.isRunning()) {
++                LOGGER.error("save-all abandoned while waiting for " + what + ": the server is stopping");
++                return false;
++            }
++            if (System.nanoTime() - deadline > 0L) {
++                LOGGER.error("save-all timed out waiting for " + what + ", " + latch.getCount() + " still pending");
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static boolean run(final MinecraftServer server, final boolean flush) throws InterruptedException {
++        final long deadline = System.nanoTime() + TIMEOUT_NANOS;
++        final AtomicBoolean ok = new AtomicBoolean(true);
++        final List<ServerLevel> levels = new ArrayList<>();
++        for (final ServerLevel level : server.getAllLevels()) {
++            levels.add(level);
++        }
++
++        // 1. snapshot every owned section of every region, atomically per world: a section cannot move between regions
++        // while the regioniser lock is held, so none can be missed by a merge or split in the middle of the walk
++        final List<LongArrayList> sectionsByWorld = new ArrayList<>();
++        int totalSections = 0;
++        for (final ServerLevel level : levels) {
++            final LongArrayList sections = new LongArrayList();
++            level.regioniser.computeForAllRegions((region) -> {
++                for (final LongIterator iterator = region.getOwnedSectionsUnsynchronised(); iterator.hasNext();) {
++                    sections.add(iterator.nextLong());
++                }
++            });
++            sectionsByWorld.add(sections);
++            totalSections += sections.size();
++        }
++        final List<ServerPlayer> players = new ArrayList<>(server.getPlayerList().getPlayers());
++
++        // 2. save everything on the thread that owns it
++        final CountDownLatch pending = new CountDownLatch(totalSections + players.size());
++
++        for (int i = 0, len = levels.size(); i < len; ++i) {
++            final ServerLevel level = levels.get(i);
++            final LongArrayList sections = sectionsByWorld.get(i);
++            final int shift = level.regioniser.sectionChunkShift;
++            for (int j = 0, jlen = sections.size(); j < jlen; ++j) {
++                final long sectionKey = sections.getLong(j);
++                final int sectionX = CoordinateUtils.getChunkX(sectionKey);
++                final int sectionZ = CoordinateUtils.getChunkZ(sectionKey);
++                RegionizedServer.getInstance().taskQueue.queueTickTaskQueue(level, sectionX << shift, sectionZ << shift, () -> {
++                    try {
++                        if (!level.moonrise$getChunkTaskScheduler().chunkHolderManager.saveSection(sectionX, sectionZ)) {
++                            ok.set(false);
++                        }
++                    } catch (final Throwable thr) {
++                        LOGGER.error("Failed to save section (" + sectionX + "," + sectionZ + ") in world '" + WorldUtil.getWorldName(level) + "'", thr);
++                        ok.set(false);
++                    } finally {
++                        pending.countDown();
++                    }
++                });
++            }
++        }
++
++        for (final ServerPlayer player : players) {
++            final boolean scheduled = player.getBukkitEntity().taskScheduler.schedule(
++                (final ServerPlayer owned) -> {
++                    try {
++                        if (TickThread.isTickThreadFor(owned)) {
++                            server.getPlayerList().save(owned);
++                        } else {
++                            LOGGER.error("Cannot save player " + owned.getScoreboardName() + " from a thread that does not own it");
++                            ok.set(false);
++                        }
++                    } catch (final Throwable thr) {
++                        LOGGER.error("Failed to save player " + owned.getScoreboardName(), thr);
++                        ok.set(false);
++                    } finally {
++                        pending.countDown();
++                    }
++                },
++                // retired: the player disconnected, and PlayerList#remove saves the player before it retires the scheduler
++                (final ServerPlayer retired) -> pending.countDown(),
++                1L
++            );
++            if (!scheduled) {
++                pending.countDown();
++            }
++        }
++
++        if (!await(server, pending, deadline, "region and player saves")) {
++            return false;
++        }
++
++        // 3. level data and global saved data belong to the global region
++        final CompletableFuture<Boolean> global = new CompletableFuture<>();
++        RegionizedServer.getInstance().addTask(() -> {
++            boolean globalOk = true;
++            try {
++                server.saveGlobalData(flush);
++                for (final ServerLevel level : levels) {
++                    try {
++                        new org.bukkit.event.world.WorldSaveEvent(level.getWorld()).callEvent();
++                        level.saveLevelData(flush);
++                    } catch (final Throwable thr) {
++                        LOGGER.error("Failed to save level data for world '" + WorldUtil.getWorldName(level) + "'", thr);
++                        globalOk = false;
++                    }
++                }
++            } catch (final Throwable thr) {
++                LOGGER.error("Failed to save global data", thr);
++                globalOk = false;
++            }
++            global.complete(Boolean.valueOf(globalOk));
++        });
++        final CountDownLatch globalLatch = new CountDownLatch(1);
++        global.whenComplete((final Boolean result, final Throwable thr) -> globalLatch.countDown());
++        if (!await(server, globalLatch, deadline, "global data")) {
++            return false;
++        }
++        if (!global.join().booleanValue()) {
++            ok.set(false);
++        }
++
++        // 4. every write the saves above queued is in a file, and the files are on disk
++        if (flush) {
++            for (final ServerLevel level : levels) {
++                if (!MoonriseRegionFileIO.flushPendingWrites(level, deadline)) {
++                    ok.set(false);
++                }
++            }
++        }
++
++        return ok.get();
++    }
++}
+diff --git a/net/minecraft/commands/Commands.java b/net/minecraft/commands/Commands.java
+index 4ddb5e7ce3529466c3930caa9aa6b18158e9a63d..53ca3cb61d11c1ae08133ffe9b423a934422699f 100644
+--- a/net/minecraft/commands/Commands.java
++++ b/net/minecraft/commands/Commands.java
+@@ -293,7 +293,7 @@ public class Commands {
+             PardonCommand.register(this.dispatcher);
+             PardonIpCommand.register(this.dispatcher);
+             //PerfCommand.register(this.dispatcher); // Folia - region threading - TODO later
+-            //SaveAllCommand.register(this.dispatcher); // Folia - region threading - TODO later
++            SaveAllCommand.register(this.dispatcher); // Folia - region threading - save-all runs the regionised save, see RegionizedSaveAll
+             SaveOffCommand.register(this.dispatcher);
+             SaveOnCommand.register(this.dispatcher);
+             SetPlayerIdleTimeoutCommand.register(this.dispatcher);
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index be15a671e0b39b455cd5983f4b90f8f3022a2ebc..918a6547a5f93ddcef7db1cc0783c3bdbc9af78c 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1759,11 +1759,11 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             if (playerSaveInterval > 0) {
+                 this.playerList.saveAll(playerSaveInterval);
+             }
+-            if (region == null && fullSave) { // Folia - region threading - don't auto save level data
++            if (region == null && fullSave && this.isAutoSave()) { // Folia - region threading - don't auto save level data // Folia - save-all - save-off stops it, as in vanilla
+                 this.saveGlobalData(false);
+             }
+             for (final ServerLevel level : (region == null ? this.getAllLevels() : Arrays.asList(region.world))) { // Folia - region threading
+-                if (level.paperConfig().chunks.autoSaveInterval.value() > 0) {
++                if (level.paperConfig().chunks.autoSaveInterval.value() > 0 && !level.noSave) { // Folia - save-all - save-off stops it, as in vanilla
+                     level.saveIncrementally(region == null && fullSave); // Folia - region threading - don't auto save level data
+                 }
+             }
+diff --git a/net/minecraft/server/commands/SaveAllCommand.java b/net/minecraft/server/commands/SaveAllCommand.java
+index 299991905c24a7018f8ac60d0c16e56fa43cd710..5595ffa4baf1feac983b04cd673fbe7cc4735e38 100644
+--- a/net/minecraft/server/commands/SaveAllCommand.java
++++ b/net/minecraft/server/commands/SaveAllCommand.java
+@@ -3,15 +3,12 @@ package net.minecraft.server.commands;
+ import com.mojang.brigadier.Command;
+ import com.mojang.brigadier.CommandDispatcher;
+ import com.mojang.brigadier.exceptions.CommandSyntaxException;
+-import com.mojang.brigadier.exceptions.SimpleCommandExceptionType;
+ import net.minecraft.commands.CommandSourceStack;
+ import net.minecraft.commands.Commands;
+ import net.minecraft.network.chat.Component;
+ import net.minecraft.server.MinecraftServer;
+ 
+ public class SaveAllCommand {
+-    private static final SimpleCommandExceptionType ERROR_FAILED = new SimpleCommandExceptionType(Component.translatable("commands.save.failed"));
+-
+     public static void register(final CommandDispatcher<CommandSourceStack> dispatcher) {
+         dispatcher.register(
+             Commands.literal("save-all")
+@@ -22,14 +19,26 @@ public class SaveAllCommand {
+     }
+ 
+     private static int saveAll(final CommandSourceStack source, final boolean flush) throws CommandSyntaxException {
++        // Folia start - region threading - the save is done by the tasks on the threads that own the data, see RegionizedSaveAll
+         source.sendSuccess(() -> Component.translatable("commands.save.saving"), false);
+         MinecraftServer server = source.getServer();
+-        boolean success = server.saveEverything(true, flush, true);
+-        if (!success) {
+-            throw ERROR_FAILED.create();
++        final java.util.concurrent.CompletableFuture<Void> replied = new java.util.concurrent.CompletableFuture<>();
++        io.papermc.paper.threadedregions.RegionizedSaveAll.saveAll(server, flush).whenComplete((final Boolean success, final Throwable thr) -> {
++            try {
++                if (success != null && success.booleanValue()) {
++                    source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
++                } else {
++                    source.sendFailure(Component.translatable("commands.save.failed"));
++                }
++            } finally {
++                replied.complete(null);
++            }
++        });
++        // an rcon client is answered when the command returns, so make it wait for the reply above
++        if (source.source instanceof net.minecraft.server.rcon.RconConsoleSource rcon) {
++            rcon.addPendingCompletion(replied);
+         }
+-
+-        source.sendSuccess(() -> Component.translatable("commands.save.success"), true);
+         return Command.SINGLE_SUCCESS;
++        // Folia end - region threading
+     }
+ }
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index cd5551c0221ad2a7b5c7d452d8d91ffc9711c3ee..290756dc86093ab8f4c0d079b11f792ee16cab3f 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -911,6 +911,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             })
+             .join();
+         // Folia end - region threading
++        rconConsoleSource.awaitPendingCompletions(10L, java.util.concurrent.TimeUnit.MINUTES); // Folia - region threading - commands that reply after they return
+         return rconConsoleSource.getCommandResponse();
+         // CraftBukkit end
+     }
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 35ab432bbd59aba80a6eaca1769e6aa82c8a7e46..9f351aa41995935da01f791f59e4d3804ab5ba19 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -201,7 +201,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     private EnvironmentAttributeSystem environmentAttributes;
+     // Paper - rewrite chunk system
+     private final GameEventDispatcher gameEventDispatcher;
+-    public boolean noSave;
++    public volatile boolean noSave; // Folia - save-all - read by every region tick, written by the global region (save-off / save-on)
+     private final SleepStatus sleepStatus;
+     private int emptyTime;
+     private final PortalForcer portalForcer;
+diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
+index 259eb7574841b1b885093b534440f8a40db4e8e2..9a1f4b2acf84a28899de907360abe6e5f272031a 100644
+--- a/net/minecraft/server/players/PlayerList.java
++++ b/net/minecraft/server/players/PlayerList.java
+@@ -480,7 +480,7 @@ public abstract class PlayerList {
+         }
+     }
+ 
+-    protected void save(final ServerPlayer player) {
++    public void save(final ServerPlayer player) { // Folia - save-all - public, callable on the owning region
+         if (!player.getBukkitEntity().isPersistent()) return; // CraftBukkit
+         player.lastSave = System.nanoTime(); // Folia - region threading - changed to nanoTime tracking
+         this.playerIo.save(player);
+diff --git a/net/minecraft/server/rcon/RconConsoleSource.java b/net/minecraft/server/rcon/RconConsoleSource.java
+index 7422b29719df2c7615fb894c52e426da608f20f7..6419d5f67f8a361045b07abebd9bdebd4c100e96 100644
+--- a/net/minecraft/server/rcon/RconConsoleSource.java
++++ b/net/minecraft/server/rcon/RconConsoleSource.java
+@@ -26,8 +26,42 @@ public class RconConsoleSource implements CommandSource {
+ 
+     public void prepareForCommand() {
+         this.buffer.setLength(0);
++        this.pendingCompletions.clear(); // Folia - region threading
+     }
+ 
++    // Folia start - region threading
++    private final java.util.concurrent.ConcurrentLinkedQueue<java.util.concurrent.CompletableFuture<?>> pendingCompletions = new java.util.concurrent.ConcurrentLinkedQueue<>();
++
++    /**
++     * Registers work the current command started that replies to this source later, so that the rcon response is not
++     * sent until it has replied.
++     */
++    public void addPendingCompletion(final java.util.concurrent.CompletableFuture<?> completion) {
++        this.pendingCompletions.add(completion);
++    }
++
++    /**
++     * Blocks until every registered completion has completed, or the timeout has passed. Must not be called by a tick thread.
++     */
++    public void awaitPendingCompletions(final long timeout, final java.util.concurrent.TimeUnit unit) {
++        final long deadline = System.nanoTime() + unit.toNanos(timeout);
++        java.util.concurrent.CompletableFuture<?> completion;
++        while ((completion = this.pendingCompletions.poll()) != null) {
++            try {
++                completion.get(Math.max(0L, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS);
++            } catch (final java.util.concurrent.TimeoutException ex) {
++                MinecraftServer.LOGGER.error("Timed out waiting for an rcon command to finish replying");
++                return;
++            } catch (final InterruptedException ex) {
++                Thread.currentThread().interrupt();
++                return;
++            } catch (final java.util.concurrent.ExecutionException ex) {
++                MinecraftServer.LOGGER.error("An rcon command failed to reply", ex);
++            }
++        }
++    }
++    // Folia end - region threading
++
+     public String getCommandResponse() {
+         return this.buffer.toString();
+     }
