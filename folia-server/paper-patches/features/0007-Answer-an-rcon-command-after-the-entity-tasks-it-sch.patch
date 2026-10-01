@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lewis Gibson <12851394+lewisgibson@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 19:04:16 +0100
+Subject: [PATCH] Answer an rcon command after the entity tasks it scheduled
+ have run
+
+xp query, enchant, give, effect, kill and the other commands that Folia hands
+to the entity scheduler send their feedback from the scheduled task, after the
+command has returned, so their rcon response was empty.
+
+The invariant: an entity task scheduled by the thread that runs an rcon command
+completes the work the rcon response waits for, whether it runs or is retired,
+see RconConsoleSource#trackQueuedWork. A schedule that is refused because the
+scheduler is retired completes it at once. Tasks scheduled by any other thread
+are not wrapped.
+
+diff --git a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
+index 9012d664958c433478ecb774241d7555d8c1a35e..935e22f528fa4dcf3191073e1d79243bde4ffdb2 100644
+--- a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
++++ b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
+@@ -209,9 +209,31 @@ public final class EntityScheduler {
+     public boolean schedule(final Consumer<? extends Entity> run, final Consumer<? extends Entity> retired, final long delay) {
+         Objects.requireNonNull(run, "Run task may not be null");
+ 
+-        final ScheduledTask task = new ScheduledTask(run, retired);
++        // an rcon command is answered after the tasks it scheduled have run or been retired
++        final Runnable rconReplied = net.minecraft.server.rcon.RconConsoleSource.trackQueuedWork();
++        final ScheduledTask task = rconReplied == null ? new ScheduledTask(run, retired) : new ScheduledTask(
++            (final Entity entity) -> {
++                try {
++                    ((Consumer<Entity>)run).accept(entity);
++                } finally {
++                    rconReplied.run();
++                }
++            },
++            (final Entity entity) -> {
++                try {
++                    if (retired != null) {
++                        ((Consumer<Entity>)retired).accept(entity);
++                    }
++                } finally {
++                    rconReplied.run();
++                }
++            }
++        );
+         synchronized (this.stateLock) {
+             if (this.tickCount == RETIRED_TICK_COUNT) {
++                if (rconReplied != null) {
++                    rconReplied.run();
++                }
+                 return false;
+             }
+             this.oneTimeDelayed.computeIfAbsent(this.tickCount + Math.max(1L, delay), (final long keyInMap) -> {

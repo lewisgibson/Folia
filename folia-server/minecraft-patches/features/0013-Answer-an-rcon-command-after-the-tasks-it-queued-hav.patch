@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lewis Gibson <12851394+lewisgibson@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 19:04:16 +0100
+Subject: [PATCH] Answer an rcon command after the tasks it queued have run
+
+Many commands that Folia dispatches to a region or to the global region (time,
+xp query, enchant, place, weather, setblock, fill, forceload, worldborder and
+more) send their feedback from the task they queue, after the command itself
+has returned. The rcon connection was answered as soon as the command returned,
+so the reply was empty, or missing the part that the task wrote. Only save-all
+registered a completion to wait for.
+
+The invariant: the rcon response of a command contains everything that the
+tasks the command itself queued on RegionizedServer or on the tick task queues
+wrote to the source, or the response is sent after at most 20 seconds. Only the
+tasks queued by the thread that runs the command are waited for, not the tasks
+those tasks queue in turn, so a plugin task that reschedules itself cannot hold
+a response. Nothing else changes: the wait happens on the rcon thread, never on
+a tick thread, and a task queued outside an rcon command is not wrapped.
+
+diff --git a/io/papermc/paper/threadedregions/RegionizedServer.java b/io/papermc/paper/threadedregions/RegionizedServer.java
+index aa575f3b76ef70ffb9f0410e7e5cfe7af384bfbd..54b6cec7941034b59c5b520f6cbc6e48dcacffcb 100644
+--- a/io/papermc/paper/threadedregions/RegionizedServer.java
++++ b/io/papermc/paper/threadedregions/RegionizedServer.java
+@@ -82,7 +82,7 @@ public final class RegionizedServer {
+     }
+ 
+     public void addTask(final Runnable run) {
+-        this.addTaskWithoutNotify(run);
++        this.addTaskWithoutNotify(net.minecraft.server.rcon.RconConsoleSource.trackQueuedTask(run)); // an rcon command is answered after the tasks it queued have run
+         this.notifyTasks();
+     }
+ 
+diff --git a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+index d1a045d47dcd12f246d95ecdfc202da357897cbf..ee2fa7b97ad81c40dbf9e550a2a78655e404e3e0 100644
+--- a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
++++ b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+@@ -65,7 +65,7 @@ public final class RegionizedTaskQueue {
+ 
+     public PrioritisedExecutor.PrioritisedTask queueTickTaskQueue(final ServerLevel world, final int chunkX, final int chunkZ,
+                                                                   final Runnable run, final Priority priority) {
+-        final PrioritisedExecutor.PrioritisedTask ret = this.createTickTaskQueue(world, chunkX, chunkZ, run, priority);
++        final PrioritisedExecutor.PrioritisedTask ret = this.createTickTaskQueue(world, chunkX, chunkZ, net.minecraft.server.rcon.RconConsoleSource.trackQueuedTask(run), priority); // Folia - an rcon command is answered after the tasks it queued have run
+ 
+         ret.queue();
+ 
+diff --git a/net/minecraft/server/dedicated/DedicatedServer.java b/net/minecraft/server/dedicated/DedicatedServer.java
+index 290756dc86093ab8f4c0d079b11f792ee16cab3f..29b1fc21c9f13ca6cd464cd1ebe5bfadb1767d29 100644
+--- a/net/minecraft/server/dedicated/DedicatedServer.java
++++ b/net/minecraft/server/dedicated/DedicatedServer.java
+@@ -903,7 +903,7 @@ public class DedicatedServer extends MinecraftServer implements ServerInterface
+             this.getCommands().performPrefixedCommand(wrapper, event.getCommand());
+         }; // Folia start - region threading
+         java.util.concurrent.CompletableFuture
+-            .runAsync(sync, io.papermc.paper.threadedregions.RegionizedServer.getInstance()::addTask)
++            .runAsync(() -> rconConsoleSource.runCommand(sync), io.papermc.paper.threadedregions.RegionizedServer.getInstance()::addTask)
+             .whenComplete((Void r, Throwable t) -> {
+                 if (t != null) {
+                     LOGGER.error("Error handling command for rcon: " + command, t);
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 9f351aa41995935da01f791f59e4d3804ab5ba19..c53de1ed84339269ad6d34e8c480c42399b8ae5f 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -440,6 +440,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler chunkTaskScheduler = this.moonrise$getChunkTaskScheduler();
+         final ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager chunkHolderManager = chunkTaskScheduler.chunkHolderManager;
+ 
++        final Runnable rconReplied = net.minecraft.server.rcon.RconConsoleSource.trackQueuedWork(); // Folia - an rcon command is answered after the chunks it loads have been handed to its callback
+         final int requiredChunks = (maxChunkX - minChunkX + 1) * (maxChunkZ - minChunkZ + 1);
+         final java.util.concurrent.atomic.AtomicInteger loadedChunks = new java.util.concurrent.atomic.AtomicInteger();
+         final Long holderIdentifier = ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler.getNextChunkLoadId();
+@@ -468,6 +469,9 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+ 
+                         chunkHolderManager.removeTicketAtLevel(ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkTaskScheduler.CHUNK_LOAD, chunkPos, ticketLevel, holderIdentifier);
+                     }
++                    if (rconReplied != null) { // Folia - rcon
++                        rconReplied.run(); // Folia - rcon
++                    } // Folia - rcon
+                 }
+             }
+         };
+diff --git a/net/minecraft/server/rcon/RconConsoleSource.java b/net/minecraft/server/rcon/RconConsoleSource.java
+index 6419d5f67f8a361045b07abebd9bdebd4c100e96..1db958150ed814b367245c948cf11b000d1d41b5 100644
+--- a/net/minecraft/server/rcon/RconConsoleSource.java
++++ b/net/minecraft/server/rcon/RconConsoleSource.java
+@@ -27,6 +27,7 @@ public class RconConsoleSource implements CommandSource {
+     public void prepareForCommand() {
+         this.buffer.setLength(0);
+         this.pendingCompletions.clear(); // Folia - region threading
++        this.queuedTasks.clear(); // Folia - region threading
+     }
+ 
+     // Folia start - region threading
+@@ -40,13 +41,69 @@ public class RconConsoleSource implements CommandSource {
+         this.pendingCompletions.add(completion);
+     }
+ 
++    private static final long QUEUED_TASK_TIMEOUT_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(20L);
++    private static final ThreadLocal<RconConsoleSource> RUNNING_COMMAND_OF = new ThreadLocal<>();
++    private final java.util.concurrent.ConcurrentLinkedQueue<java.util.concurrent.CompletableFuture<?>> queuedTasks = new java.util.concurrent.ConcurrentLinkedQueue<>();
++
++    /**
++     * Runs the command of this source, so that every task the command itself queues for a region or the global region is waited for before the rcon response is sent, see {@link #trackQueuedTask}.
++     */
++    public void runCommand(final Runnable command) {
++        final RconConsoleSource previous = RUNNING_COMMAND_OF.get();
++        RUNNING_COMMAND_OF.set(this);
++        try {
++            command.run();
++        } finally {
++            RUNNING_COMMAND_OF.set(previous);
++        }
++    }
++
++    /**
++     * Registers work that the running rcon command starts on another thread and returns the callback that says it is done,
++     * or null if the calling thread is not running an rcon command. The rcon response waits for the callback, so that
++     * what the work writes to the source is part of the response. Only the work that the command itself starts is waited
++     * for, not the work that this work starts in turn, because a plugin task that reschedules itself would never end.
++     */
++    public static Runnable trackQueuedWork() {
++        final RconConsoleSource source = RUNNING_COMMAND_OF.get();
++        if (source == null) {
++            return null;
++        }
++        final java.util.concurrent.CompletableFuture<Void> done = new java.util.concurrent.CompletableFuture<>();
++        source.queuedTasks.add(done);
++        return () -> done.complete(null);
++    }
++
++    /**
++     * Wraps a task that is being queued for another thread so that the rcon response of the running command waits for
++     * it, see {@link #trackQueuedWork}. Returns the task unchanged if the calling thread is not running an rcon command.
++     */
++    public static Runnable trackQueuedTask(final Runnable task) {
++        final Runnable done = trackQueuedWork();
++        if (done == null) {
++            return task;
++        }
++        return () -> {
++            try {
++                task.run();
++            } finally {
++                done.run();
++            }
++        };
++    }
++
+     /**
+      * Blocks until every registered completion has completed, or the timeout has passed. Must not be called by a tick thread.
+      */
+     public void awaitPendingCompletions(final long timeout, final java.util.concurrent.TimeUnit unit) {
+-        final long deadline = System.nanoTime() + unit.toNanos(timeout);
++        this.awaitCompletions(this.pendingCompletions, System.nanoTime() + unit.toNanos(timeout));
++        // a queued task that never runs, such as one dropped by a region that was merged away, must not hold the response for ever
++        this.awaitCompletions(this.queuedTasks, System.nanoTime() + QUEUED_TASK_TIMEOUT_NANOS);
++    }
++
++    private void awaitCompletions(final java.util.concurrent.ConcurrentLinkedQueue<java.util.concurrent.CompletableFuture<?>> completions, final long deadline) {
+         java.util.concurrent.CompletableFuture<?> completion;
+-        while ((completion = this.pendingCompletions.poll()) != null) {
++        while ((completion = completions.poll()) != null) {
+             try {
+                 completion.get(Math.max(0L, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS);
+             } catch (final java.util.concurrent.TimeoutException ex) {
