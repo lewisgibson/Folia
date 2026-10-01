@@ -14477,7 +14477,7 @@ index bb5f66c62c9541bb76a9faad9e9ee91c1466fc6a..66d7bb9418832638c220a08d06c01ef0
              return blockToFallLocation(blockState);
          } else {
 diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
-index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709efad6f6b 100644
+index d958c4717739e588c5f8985dec5d215c745f49fc..096f254e4597b569eea3556a0a36d32201ff4de2 100644
 --- a/net/minecraft/world/entity/Entity.java
 +++ b/net/minecraft/world/entity/Entity.java
 @@ -172,7 +172,7 @@ public abstract class Entity
@@ -14672,7 +14672,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
          if (!this.level().paperConfig().scoreboards.allowNonPlayerEntitiesOnScoreboards && !(this instanceof Player)) { return null; } // Paper - Perf: Disable Scoreboards for non players by default
          return this.level().getScoreboard().getPlayersTeam(this.getScoreboardName());
      }
-@@ -4087,7 +4118,791 @@ public abstract class Entity
+@@ -4087,7 +4118,792 @@ public abstract class Entity
          this.portalProcess = oldEntity.portalProcess;
      }
  
@@ -14983,6 +14983,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
 +        }
 +        if (pos != null) {
 +            this.setPosRaw(pos.x, pos.y, pos.z);
++            this.reapplyPosition();
 +        }
 +        this.setOldPosAndRot();
 +    }
@@ -15464,7 +15465,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
          // Paper start - Fix item duplication and teleport issues
          if ((!this.isAlive() || !this.valid) && (transition.newLevel() != this.level)) {
              LOGGER.warn("Illegal Entity Teleport {} to {}:{}", this, transition.newLevel(), transition.position(), new Throwable());
-@@ -4296,6 +5111,12 @@ public abstract class Entity
+@@ -4296,6 +5112,12 @@ public abstract class Entity
          }
      }
  
@@ -15477,7 +15478,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
      protected void removeAfterChangingDimensions() {
          this.setRemoved(Entity.RemovalReason.CHANGED_DIMENSION, null); // CraftBukkit - add Bukkit remove cause
          if (this instanceof Leashable leashable && leashable.isLeashed()) { // Paper - only call if it is leashed
-@@ -4629,6 +5450,12 @@ public abstract class Entity
+@@ -4629,6 +5451,12 @@ public abstract class Entity
      }
  
      public void startSeenByPlayer(final ServerPlayer player) {
@@ -15490,7 +15491,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
      }
  
      public void stopSeenByPlayer(final ServerPlayer player) {
-@@ -4638,6 +5465,12 @@ public abstract class Entity
+@@ -4638,6 +5466,12 @@ public abstract class Entity
              new io.papermc.paper.event.player.PlayerUntrackEntityEvent(player.getBukkitEntity(), this.getBukkitEntity()).callEvent();
          }
          // Paper end - entity tracking events
@@ -15503,7 +15504,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
      }
  
      public float rotate(final Rotation rotation) {
-@@ -5047,7 +5880,8 @@ public abstract class Entity
+@@ -5047,7 +5881,8 @@ public abstract class Entity
              return;
          }
          // Paper end - Block invalid positions and bounding box
@@ -15513,7 +15514,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
              synchronized (this.posLock) { // Paper - detailed watchdog information
              this.position = new Vec3(x, y, z);
              } // Paper - detailed watchdog information
-@@ -5080,7 +5914,7 @@ public abstract class Entity
+@@ -5080,7 +5915,7 @@ public abstract class Entity
          }
          // Paper start - Block invalid positions and bounding box; don't allow desync of pos and AABB
          // hanging has its own special logic
@@ -15522,7 +15523,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
              this.setBoundingBox(this.makeBoundingBox());
          }
          // Paper end - Block invalid positions and bounding box
-@@ -5186,6 +6020,12 @@ public abstract class Entity
+@@ -5186,6 +6021,12 @@ public abstract class Entity
          return this.removalReason != null;
      }
  
@@ -15535,7 +15536,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
      public Entity.@Nullable RemovalReason getRemovalReason() {
          return this.removalReason;
      }
-@@ -5200,6 +6040,9 @@ public abstract class Entity
+@@ -5200,6 +6041,9 @@ public abstract class Entity
          // Paper end - rewrite chunk system
          org.bukkit.craftbukkit.event.CraftEventFactory.callEntityRemoveEvent(this, cause); // CraftBukkit
          final boolean alreadyRemoved = this.removalReason != null; // Paper - Folia schedulers
@@ -15545,7 +15546,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
          if (this.removalReason == null) {
              this.removalReason = reason;
              this.removeEventCause = cause; // Paper
-@@ -5228,6 +6071,10 @@ public abstract class Entity
+@@ -5228,6 +6072,10 @@ public abstract class Entity
          // Paper end
      }
  
@@ -15556,7 +15557,7 @@ index d958c4717739e588c5f8985dec5d215c745f49fc..a9388060f17c186b5dee15ed145be709
      // Paper start - Folia schedulers
      /**
       * Invoked only when the entity is truly removed from the server, never to be added to any world.
-@@ -5239,7 +6086,7 @@ public abstract class Entity
+@@ -5239,7 +6087,7 @@ public abstract class Entity
      // Paper end - Folia schedulers
      // Paper start - optimise Folia entity scheduler
      public final void registerScheduler() {
