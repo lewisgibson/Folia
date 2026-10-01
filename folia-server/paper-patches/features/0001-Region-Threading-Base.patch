@@ -762,7 +762,7 @@ index 5c40c3d0ea8e1e59d39d5f4da6377309119e784b..6ef0042a355c65262bdb89dcf151bd64
  }
 -
 diff --git a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
-index 6f580f7b1708cda1cb63aea6607e369a6d771d1a..9012d664958c433478ecb774241d7555d8c1a35e 100644
+index 6f580f7b1708cda1cb63aea6607e369a6d771d1a..f237bb199f5048854da9e14a5f679b11f863c8dc 100644
 --- a/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 +++ b/src/main/java/io/papermc/paper/threadedregions/EntityScheduler.java
 @@ -100,6 +100,14 @@ public final class EntityScheduler {
@@ -780,6 +780,42 @@ index 6f580f7b1708cda1cb63aea6607e369a6d771d1a..9012d664958c433478ecb774241d7555
      /**
       * Retires the scheduler, preventing new tasks from being scheduled and invoking the retired callback
       * on all currently scheduled tasks.
+@@ -201,9 +209,34 @@ public final class EntityScheduler {
+     public boolean schedule(final Consumer<? extends Entity> run, final Consumer<? extends Entity> retired, final long delay) {
+         Objects.requireNonNull(run, "Run task may not be null");
+ 
+-        final ScheduledTask task = new ScheduledTask(run, retired);
++        // Folia start - region threading
++        final Runnable rconReplied = net.minecraft.server.rcon.RconConsoleSource.trackQueuedWork();
++        final ScheduledTask task = rconReplied == null ? new ScheduledTask(run, retired) : new ScheduledTask(
++            (final Entity entity) -> {
++                try {
++                    ((Consumer<Entity>)run).accept(entity);
++                } finally {
++                    rconReplied.run();
++                }
++            },
++            (final Entity entity) -> {
++                try {
++                    if (retired != null) {
++                        ((Consumer<Entity>)retired).accept(entity);
++                    }
++                } finally {
++                    rconReplied.run();
++                }
++            }
++        );
++        // Folia end - region threading
+         synchronized (this.stateLock) {
+             if (this.tickCount == RETIRED_TICK_COUNT) {
++                // Folia start - region threading
++                if (rconReplied != null) {
++                    rconReplied.run();
++                }
++                // Folia end - region threading
+                 return false;
+             }
+             this.oneTimeDelayed.computeIfAbsent(this.tickCount + Math.max(1L, delay), (final long keyInMap) -> {
 diff --git a/src/main/java/io/papermc/paper/util/MCUtil.java b/src/main/java/io/papermc/paper/util/MCUtil.java
 index f659aba1587d70b8d4011e66f40f480ff4deeeb4..532076c7358aa355ce5144075fe6bd79de6ef9e6 100644
 --- a/src/main/java/io/papermc/paper/util/MCUtil.java
