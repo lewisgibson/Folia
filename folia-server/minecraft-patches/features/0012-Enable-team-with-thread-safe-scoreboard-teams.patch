@@ -1,39 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Lewis Gibson <12851394+lewisgibson@users.noreply.github.com>
-Date: Thu, 1 Oct 2026 18:23:28 +0100
+Date: Thu, 1 Oct 2026 22:29:11 +0100
 Subject: [PATCH] Enable /team with thread safe scoreboard teams
 
-/team was disabled because the scoreboard is world global state shared by all
-regions. Enable it, for the team subcommands only (scoreboard, teammsg and the
-Bukkit scoreboard API stay disabled).
-
-The invariant: a team, its members and its options are only ever observed
-consistently, by any thread, and every online player's client sees each change
-exactly once, in the order it was made.
-
-How it holds:
-- The team maps of Scoreboard are ConcurrentHashMaps and PlayerTeam#players is a
-  concurrent set, because region threads read them (Entity#getTeam, display
-  names, collision rules) while /team writes them. The option fields of
-  PlayerTeam are volatile. Entity#getTeam, which Folia had stubbed to return null,
-  reads them again, so selectors, collision rules, friendly fire and death
-  messages see the teams.
-- All mutation, together with the packets that announce it, happens under
-  Scoreboard#teamLock, so concurrent /team commands, from rcon on the global
-  region or from a player on its own region, cannot interleave their packets
-  differently from their changes.
-- A player used to receive the teams in PlayerList#updateEntireScoreboard, which
-  Folia had disabled, so players that joined after a team existed never saw it.
-  ServerScoreboard#syncTeamsTo sends the current teams to a player that has just
-  joined and been added to the player list, under teamLock, and marks its
-  connection as synced. Team changes are sent only to synced connections, so a
-  change either happened before the snapshot, and is in it, or after it, and is
-  broadcast to the player.
-- Joining a team that another command removed after this one resolved it does
-  nothing, and the scoreboard is saved from a snapshot taken under teamLock.
+/team was disabled in the base patch. Run it on the global region and make the teams safe to read from the other regions.
 
 diff --git a/net/minecraft/commands/Commands.java b/net/minecraft/commands/Commands.java
-index 4ddb5e7ce3529466c3930caa9aa6b18158e9a63d..936309e49000ac43f806e1a665773a6446b46ad3 100644
+index 4ddb5e7ce3529466c3930caa9aa6b18158e9a63d..dcc256e31bd3c38365dcccf92ae4b63f9d8f2326 100644
 --- a/net/minecraft/commands/Commands.java
 +++ b/net/minecraft/commands/Commands.java
 @@ -252,7 +252,7 @@ public class Commands {
@@ -41,197 +14,105 @@ index 4ddb5e7ce3529466c3930caa9aa6b18158e9a63d..936309e49000ac43f806e1a665773a64
          SummonCommand.register(this.dispatcher, context);
          //TagCommand.register(this.dispatcher); // Folia - region threading - TODO later
 -        //TeamCommand.register(this.dispatcher, context); // Folia - region threading - TODO later
-+        TeamCommand.register(this.dispatcher, context); // Folia - region threading - teams are thread safe, see Scoreboard#teamLock
++        TeamCommand.register(this.dispatcher, context);
          //TeamMsgCommand.register(this.dispatcher); // Folia - region threading - TODO later
          TeleportCommand.register(this.dispatcher);
          TellRawCommand.register(this.dispatcher, context);
 diff --git a/net/minecraft/server/ServerScoreboard.java b/net/minecraft/server/ServerScoreboard.java
-index 7ffd683c42557052d7bfa963d87e68f4e8f62d6c..5ce06ca9678db2dfa7e3fee6b804c0287ba966f9 100644
+index 7ffd683c42557052d7bfa963d87e68f4e8f62d6c..d5a92be62bd371795cad7dc2db5e3ca685289994 100644
 --- a/net/minecraft/server/ServerScoreboard.java
 +++ b/net/minecraft/server/ServerScoreboard.java
-@@ -27,7 +27,7 @@ import org.jspecify.annotations.Nullable;
- public class ServerScoreboard extends Scoreboard {
-     private final MinecraftServer server;
-     private final Set<Objective> trackedObjectives = Sets.newHashSet();
--    private boolean dirty;
-+    private volatile boolean dirty; // Folia - region threading - set by whichever thread runs /team, read by the thread that saves
- 
-     public ServerScoreboard(final MinecraftServer server) {
-         this.server = server;
-@@ -113,18 +113,21 @@ public class ServerScoreboard extends Scoreboard {
- 
-     @Override
-     public boolean addPlayerToTeam(final String player, final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         if (super.addPlayerToTeam(player, team)) {
--            this.broadcastAll(ClientboundSetPlayerTeamPacket.createPlayerPacket(team, player, ClientboundSetPlayerTeamPacket.Action.ADD)); // CraftBukkit
-+            this.broadcastTeamPacket(ClientboundSetPlayerTeamPacket.createPlayerPacket(team, player, ClientboundSetPlayerTeamPacket.Action.ADD)); // CraftBukkit // Folia - region threading
-             this.updatePlayerWaypoint(player);
-             this.setDirty();
-             return true;
-         } else {
-             return false;
-         }
-+        } // Folia - region threading
-     }
- 
-     // Paper start - Multiple Entries with Scoreboards
-     public boolean addPlayersToTeam(java.util.Collection<String> players, PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         boolean anyAdded = false;
-         for (String playerName : players) {
-             if (super.addPlayerToTeam(playerName, team)) {
-@@ -133,31 +136,36 @@ public class ServerScoreboard extends Scoreboard {
-         }
- 
-         if (anyAdded) {
--            this.broadcastAll(ClientboundSetPlayerTeamPacket.createMultiplePlayerPacket(team, players, ClientboundSetPlayerTeamPacket.Action.ADD));
-+            this.broadcastTeamPacket(ClientboundSetPlayerTeamPacket.createMultiplePlayerPacket(team, players, ClientboundSetPlayerTeamPacket.Action.ADD)); // Folia - region threading
-             this.setDirty();
-             return true;
-         } else {
-             return false;
-         }
-+        } // Folia - region threading
-     }
-     // Paper end - Multiple Entries with Scoreboards
- 
-     @Override
-     public void removePlayerFromTeam(final String player, final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         super.removePlayerFromTeam(player, team);
--        this.broadcastAll(ClientboundSetPlayerTeamPacket.createPlayerPacket(team, player, ClientboundSetPlayerTeamPacket.Action.REMOVE)); // CraftBukkit
-+        this.broadcastTeamPacket(ClientboundSetPlayerTeamPacket.createPlayerPacket(team, player, ClientboundSetPlayerTeamPacket.Action.REMOVE)); // CraftBukkit // Folia - region threading
-         this.updatePlayerWaypoint(player);
-         this.setDirty();
-+        } // Folia - region threading
-     }
- 
-     // Paper start - Multiple Entries with Scoreboards
-     public void removePlayersFromTeam(java.util.Collection<String> players, PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         for (String playerName : players) {
-             super.removePlayerFromTeam(playerName, team);
-         }
- 
--        this.broadcastAll(ClientboundSetPlayerTeamPacket.createMultiplePlayerPacket(team, players, ClientboundSetPlayerTeamPacket.Action.REMOVE));
-+        this.broadcastTeamPacket(ClientboundSetPlayerTeamPacket.createMultiplePlayerPacket(team, players, ClientboundSetPlayerTeamPacket.Action.REMOVE)); // Folia - region threading
-         this.setDirty();
-+        } // Folia - region threading
-     }
-     // Paper end - Multiple Entries with Scoreboards
- 
-@@ -189,25 +197,31 @@ public class ServerScoreboard extends Scoreboard {
- 
-     @Override
-     public void onTeamAdded(final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         super.onTeamAdded(team);
--        this.broadcastAll(ClientboundSetPlayerTeamPacket.createAddOrModifyPacket(team, true)); // CraftBukkit
-+        this.broadcastTeamPacket(ClientboundSetPlayerTeamPacket.createAddOrModifyPacket(team, true)); // CraftBukkit // Folia - region threading
-         this.setDirty();
-+        } // Folia - region threading
-     }
- 
-     @Override
-     public void onTeamChanged(final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         super.onTeamChanged(team);
--        this.broadcastAll(ClientboundSetPlayerTeamPacket.createAddOrModifyPacket(team, false)); // CraftBukkit
-+        this.broadcastTeamPacket(ClientboundSetPlayerTeamPacket.createAddOrModifyPacket(team, false)); // CraftBukkit // Folia - region threading
-         this.updateTeamWaypoints(team);
-         this.setDirty();
-+        } // Folia - region threading
-     }
- 
-     @Override
-     public void onTeamRemoved(final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         super.onTeamRemoved(team);
--        this.broadcastAll(ClientboundSetPlayerTeamPacket.createRemovePacket(team)); // CraftBukkit
-+        this.broadcastTeamPacket(ClientboundSetPlayerTeamPacket.createRemovePacket(team)); // CraftBukkit // Folia - region threading
-         this.updateTeamWaypoints(team);
-         this.setDirty();
-+        } // Folia - region threading
-     }
- 
-     protected void setDirty() {
-@@ -216,8 +230,10 @@ public class ServerScoreboard extends Scoreboard {
- 
-     public void storeToSaveDataIfDirty(final ScoreboardSaveData saveData) {
-         if (this.dirty) {
--            this.dirty = false;
--            saveData.setData(this.store());
-+            synchronized (this.teamLock) { // Folia - region threading - one consistent snapshot of the teams
-+                this.dirty = false;
-+                saveData.setData(this.store());
-+            }
-         }
-     }
- 
-@@ -309,6 +325,38 @@ public class ServerScoreboard extends Scoreboard {
-                 .forEach(player -> level.getWaypointManager().remakeConnections(player));
-         }
-     }
-+    // Folia start - region threading
-+    /**
-+     * Sends a team packet to every player that has already been given the current teams by {@link #syncTeamsTo}. Must be
-+     * called with {@link #teamLock} held, which is what makes a joining player see each change exactly once: it either
-+     * happened before the join snapshot, and is in it, or after, and is broadcast to the player.
-+     */
-+    private void broadcastTeamPacket(final Packet<?> packet) {
-+        for (ServerPlayer serverPlayer : this.server.getPlayerList().getPlayers()) {
-+            final net.minecraft.server.network.ServerGamePacketListenerImpl connection = serverPlayer.connection;
-+            if (connection != null && connection.teamsSynced && serverPlayer.getBukkitEntity().getScoreboard().getHandle() == this) {
-+                connection.send(packet);
-+            }
-+        }
-+    }
-+
-+    /**
-+     * Sends the teams to a player that has just joined and starts sending it team changes. Safe to call from the
-+     * player's own region while another thread runs /team.
-+     */
-+    public void syncTeamsTo(final ServerPlayer player) {
-+        synchronized (this.teamLock) {
-+            if (player.getBukkitEntity().getScoreboard().getHandle() != this) {
-+                return;
-+            }
-+            for (final PlayerTeam team : this.getPlayerTeams()) {
-+                player.connection.send(ClientboundSetPlayerTeamPacket.createAddOrModifyPacket(team, true));
-+            }
-+            player.connection.teamsSynced = true;
-+        }
-+    }
-+    // Folia end - region threading
-+
+@@ -312,7 +312,7 @@ public class ServerScoreboard extends Scoreboard {
      // CraftBukkit start - Send to players
      private void broadcastAll(Packet<?> packet) {
          for (ServerPlayer serverPlayer : this.server.getPlayerList().getPlayers()) {
+-            if (serverPlayer.getBukkitEntity().getScoreboard().getHandle() == this) {
++            if (serverPlayer.connection.teamsSynced && serverPlayer.getBukkitEntity().getScoreboard().getHandle() == this) { // Folia - region threading
+                 serverPlayer.connection.send(packet);
+             }
+         }
+diff --git a/net/minecraft/server/commands/TeamCommand.java b/net/minecraft/server/commands/TeamCommand.java
+index b9c04e559db8352def5f6d73a5f7532e7cce9e0e..dce7b011c8b01d08e5f83b4973bed39f8929e796 100644
+--- a/net/minecraft/server/commands/TeamCommand.java
++++ b/net/minecraft/server/commands/TeamCommand.java
+@@ -61,7 +61,7 @@ public class TeamCommand {
+     );
+ 
+     public static void register(final CommandDispatcher<CommandSourceStack> dispatcher, final CommandBuildContext context) {
+-        dispatcher.register(
++        dispatcher.register(onGlobalRegion( // Folia - region threading
+             Commands.literal("team")
+                 .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))
+                 .then(
+@@ -266,8 +266,37 @@ public class TeamCommand {
+                                 )
+                         )
+                 )
+-        );
++        )); // Folia - region threading
++    }
++
++    // Folia start - region threading
++    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> onGlobalRegion(final com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> team) {
++        return (com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack>)onGlobalRegion(team.build());
++    }
++
++    private static com.mojang.brigadier.builder.ArgumentBuilder<CommandSourceStack, ?> onGlobalRegion(final com.mojang.brigadier.tree.CommandNode<CommandSourceStack> node) {
++        final com.mojang.brigadier.builder.ArgumentBuilder<CommandSourceStack, ?> builder = node.createBuilder();
++        final Command<CommandSourceStack> command = node.getCommand();
++        if (command != null) {
++            builder.executes(context -> {
++                io.papermc.paper.threadedregions.RegionizedServer.getInstance().addTask(() -> {
++                    try {
++                        command.run(context);
++                    } catch (final CommandSyntaxException ex) {
++                        context.getSource().sendFailure((Component)ex.getRawMessage());
++                    }
++                });
++                return Command.SINGLE_SUCCESS;
++            });
++        }
++
++        for (final com.mojang.brigadier.tree.CommandNode<CommandSourceStack> child : node.getChildren()) {
++            builder.then(onGlobalRegion(child));
++        }
++
++        return builder;
+     }
++    // Folia end - region threading
+ 
+     private static Component getFirstMemberName(final Collection<ScoreHolder> members) {
+         return members.iterator().next().getFeedbackDisplayName();
 diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
-index c86b1fd5e200c478d178be32791b6e8c960d47e2..a3fc2341e186dc7451869ec9e2653776de8e29ed 100644
+index c86b1fd5e200c478d178be32791b6e8c960d47e2..99f75a204a9c5eaa403c83b7cfc5943173d7a1ea 100644
 --- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 +++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 @@ -269,6 +269,7 @@ public class ServerGamePacketListenerImpl
      private static final Component INVALID_COMMAND_SIGNATURE = Component.translatable("chat.disabled.invalid_command_signature").withStyle(ChatFormatting.RED);
      private static final int MAX_COMMAND_SUGGESTIONS = 1000;
      public ServerPlayer player;
-+    public volatile boolean teamsSynced; // Folia - region threading - set by ServerScoreboard#syncTeamsTo, after which team changes are sent to this connection
++    public volatile boolean teamsSynced; // Folia - region threading
      public final PlayerChunkSender chunkSender;
      private int tickCount;
      private int ackBlockChangesUpTo = -1;
 diff --git a/net/minecraft/server/players/PlayerList.java b/net/minecraft/server/players/PlayerList.java
-index 259eb7574841b1b885093b534440f8a40db4e8e2..15e65681dc0c1014739d5233f55f7c3b7e8c76d0 100644
+index 259eb7574841b1b885093b534440f8a40db4e8e2..b63bc78331df033b3ac2d91a5a9344eed70fe856 100644
 --- a/net/minecraft/server/players/PlayerList.java
 +++ b/net/minecraft/server/players/PlayerList.java
-@@ -294,6 +294,7 @@ public abstract class PlayerList {
-         this.players.add(player);
-         this.playersByName.put(player.getScoreboardName().toLowerCase(java.util.Locale.ROOT), player); // Spigot
-         this.playersByUUID.put(player.getUUID(), player);
-+        level.getScoreboard().syncTeamsTo(player); // Folia - region threading - teams only, once the player is in the list so that no team change falls between the snapshot and the broadcast, see ServerScoreboard#syncTeamsTo
-         // this.broadcastAll(ClientboundPlayerInfoUpdatePacket.createPlayerInitializing(List.of(player))); // CraftBukkit - replaced with loop below
-         // Paper start - Fire PlayerJoinEvent when Player is actually ready; correctly register player BEFORE PlayerJoinEvent, so the entity is valid and doesn't require tick delay hacks
-         player.suppressTrackerForLogin = true;
+@@ -272,7 +272,12 @@ public abstract class PlayerList {
+         this.sendPlayerPermissionLevel(player);
+         player.getStats().markAllDirty();
+         player.getRecipeBook().sendInitialRecipeBook(player);
+-        //this.updateEntireScoreboard(level.getScoreboard(), player); // Folia - region threading
++        // Folia start - region threading
++        io.papermc.paper.threadedregions.RegionizedServer.getInstance().addTask(() -> {
++            this.updateEntireScoreboard(this.server.getScoreboard(), player);
++            player.connection.teamsSynced = true;
++        });
++        // Folia end - region threading
+         this.server.invalidateStatus();
+         MutableComponent component;
+         if (player.getGameProfile().name().equalsIgnoreCase(oldName)) {
 diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
 index 75dabd3e7b6077b5ae8ee30048786442742b93f9..84cec6179060a15524331db56271c5e8660961fe 100644
 --- a/net/minecraft/world/entity/Entity.java
@@ -249,7 +130,7 @@ index 75dabd3e7b6077b5ae8ee30048786442742b93f9..84cec6179060a15524331db56271c5e8
          return this.level().getScoreboard().getPlayersTeam(this.getScoreboardName());
      }
 diff --git a/net/minecraft/world/scores/PlayerTeam.java b/net/minecraft/world/scores/PlayerTeam.java
-index 2bdbb8451974f0b8d6e94d390ac735f4ccffd954..4483f7c1cb6f20399bcd6569fdc2daf7d09c6a24 100644
+index 2bdbb8451974f0b8d6e94d390ac735f4ccffd954..116e68c63ed08dd6f46751d505aba9745b1c2946 100644
 --- a/net/minecraft/world/scores/PlayerTeam.java
 +++ b/net/minecraft/world/scores/PlayerTeam.java
 @@ -25,16 +25,16 @@ public class PlayerTeam extends Team {
@@ -266,7 +147,7 @@ index 2bdbb8451974f0b8d6e94d390ac735f4ccffd954..4483f7c1cb6f20399bcd6569fdc2daf7
 -    private Team.Visibility deathMessageVisibility = Team.Visibility.ALWAYS;
 -    private Optional<TeamColor> color = Optional.empty();
 -    private Team.CollisionRule collisionRule = Team.CollisionRule.ALWAYS;
-+    private final Set<String> players = java.util.concurrent.ConcurrentHashMap.newKeySet(); // Folia - region threading - read by region threads while /team changes it
++    private final Set<String> players = Sets.newConcurrentHashSet(); // Folia - region threading
 +    private volatile Component displayName;
 +    private volatile Component playerPrefix = CommonComponents.EMPTY;
 +    private volatile Component playerSuffix = CommonComponents.EMPTY;
@@ -280,101 +161,35 @@ index 2bdbb8451974f0b8d6e94d390ac735f4ccffd954..4483f7c1cb6f20399bcd6569fdc2daf7
  
      public PlayerTeam(final Scoreboard scoreboard, final String name) {
 diff --git a/net/minecraft/world/scores/Scoreboard.java b/net/minecraft/world/scores/Scoreboard.java
-index 4a15851bda30c918c58c96d2cb98b74f30db396c..16e2a24a50663391324a4d15311115a8050b9d6e 100644
+index 4a15851bda30c918c58c96d2cb98b74f30db396c..7123be188d6cfbe7cdf8b3f8a473be4eaedac1d2 100644
 --- a/net/minecraft/world/scores/Scoreboard.java
 +++ b/net/minecraft/world/scores/Scoreboard.java
-@@ -34,8 +34,12 @@ public class Scoreboard {
+@@ -34,8 +34,8 @@ public class Scoreboard {
      private final Reference2ObjectMap<ObjectiveCriteria, List<Objective>> objectivesByCriteria = new Reference2ObjectOpenHashMap<>();
      private final Map<String, PlayerScores> playerScores = new Object2ObjectOpenHashMap<>(16, 0.5F);
      private final Map<DisplaySlot, Objective> displayObjectives = new EnumMap<>(DisplaySlot.class);
 -    private final Object2ObjectMap<String, PlayerTeam> teamsByName = new Object2ObjectOpenHashMap<>();
 -    private final Object2ObjectMap<String, PlayerTeam> teamsByPlayer = new Object2ObjectOpenHashMap<>();
-+    // Folia start - region threading - teams are read by every region (Entity#getTeam, display names, collisions) and written by whichever thread runs /team
-+    // so the maps are concurrent for the readers, and all mutation, together with the packets it sends, is serialised by teamLock
-+    public final Object teamLock = new Object();
-+    private final Map<String, PlayerTeam> teamsByName = new java.util.concurrent.ConcurrentHashMap<>();
-+    private final Map<String, PlayerTeam> teamsByPlayer = new java.util.concurrent.ConcurrentHashMap<>();
-+    // Folia end - region threading
++    private final Map<String, PlayerTeam> teamsByName = new java.util.concurrent.ConcurrentHashMap<>(); // Folia - region threading
++    private final Map<String, PlayerTeam> teamsByPlayer = new java.util.concurrent.ConcurrentHashMap<>(); // Folia - region threading
  
      public @Nullable Objective getObjective(final @Nullable String name) {
          return this.objectivesByName.get(name);
-@@ -243,10 +247,11 @@ public class Scoreboard {
+@@ -243,7 +243,7 @@ public class Scoreboard {
      }
  
      public @Nullable PlayerTeam getPlayerTeam(final String name) {
 -        return this.teamsByName.get(name);
-+        return name == null ? null : this.teamsByName.get(name); // Folia - region threading - concurrent map, no null keys
++        return name == null ? null : this.teamsByName.get(name); // Folia - region threading
      }
  
      public PlayerTeam addPlayerTeam(final String name) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         PlayerTeam team = this.getPlayerTeam(name);
-         if (team != null) {
-             LOGGER.warn("Requested creation of existing team '{}'", name);
-@@ -257,9 +262,11 @@ public class Scoreboard {
-             this.onTeamAdded(team);
-             return team;
-         }
-+        } // Folia - region threading
-     }
- 
-     public void removePlayerTeam(final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         this.teamsByName.remove(team.getName());
- 
-         for (String player : team.getPlayers()) {
-@@ -267,18 +274,26 @@ public class Scoreboard {
-         }
- 
-         this.onTeamRemoved(team);
-+        } // Folia - region threading
-     }
- 
-     public boolean addPlayerToTeam(final String player, final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-+        if (this.teamsByName.get(team.getName()) != team) { // Folia - region threading - the team was removed by another thread after it was resolved
-+            return false;
-+        }
-+
-         if (this.getPlayersTeam(player) != null) {
-             this.removePlayerFromTeam(player);
-         }
- 
-         this.teamsByPlayer.put(player, team);
-         return team.getPlayers().add(player);
-+        } // Folia - region threading
-     }
- 
-     public boolean removePlayerFromTeam(final String player) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         PlayerTeam team = this.getPlayersTeam(player);
-         if (team != null) {
-             this.removePlayerFromTeam(player, team);
-@@ -286,15 +301,18 @@ public class Scoreboard {
-         } else {
-             return false;
-         }
-+        } // Folia - region threading
-     }
- 
-     public void removePlayerFromTeam(final String player, final PlayerTeam team) {
-+        synchronized (this.teamLock) { // Folia - region threading
-         if (this.getPlayersTeam(player) != team) {
-             throw new IllegalStateException("Player is either on another team or not on any team. Cannot remove from team '" + team.getName() + "'.");
-         }
- 
-         this.teamsByPlayer.remove(player);
-         team.getPlayers().remove(player);
-+        } // Folia - region threading
-     }
- 
-     public Collection<String> getTeamNames() {
-@@ -306,7 +324,7 @@ public class Scoreboard {
+@@ -306,7 +306,7 @@ public class Scoreboard {
      }
  
      public @Nullable PlayerTeam getPlayersTeam(final String name) {
 -        return this.teamsByPlayer.get(name);
-+        return name == null ? null : this.teamsByPlayer.get(name); // Folia - region threading - concurrent map, no null keys
++        return name == null ? null : this.teamsByPlayer.get(name); // Folia - region threading
      }
  
      public void onObjectiveAdded(final Objective objective) {
